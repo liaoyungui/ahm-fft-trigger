@@ -1,31 +1,30 @@
 // FFTTriggerController.cs
 //
-// AHM FFT Trigger Controller (v2.2.0) — RULE ONLY
-// - Reads operator_status.json (from Operator Zone Engine v2.1.0)
-// - When operator_zone ENTERS Zone C/D, it:
-//     1) acquires exclusive lock
-//     2) stops RMS poller service (exclusive VSE access)
-//     3) pre-FFT quick overall read (short raw stream -> RMS)
-//     4) captures FFT raw samples (time series) for C1/C2 (+C3 if VSE2 enabled)
-//     5) post-FFT quick overall read
-//     6) writes event marker JSON
-//     7) restarts RMS poller
+// AHM FFT Trigger Controller (v2.2.1) — RULE ONLY / HARDENED
 //
-// Notes:
-// - No Newtonsoft / no System.Text.Json => Mono/mcs friendly
-// - Captures RAW CSV (idx,x,z). FFT spectrum can be computed elsewhere later.
-// - Mapping (same intent as RMS Poller v2.0.6):
-//     VSE1 sensor[0..3] => C1(X,Z) + C2(X,Z)
-//     VSE2 sensor[0..1] => C3(X,Z)
+// Key hardening vs v2.2.0:
+// - Avoids IParametersAnReSa.writeToDevice() (can native-abort in libVSEUtilities.so)
+// - Triggers only on new status_row_ts (no spam when operator_status.json updates frequently)
+// - Persists controller state to disk (survive restart without retriggering same row)
+// - Keeps workflow deterministic/offline-first
 //
-// Build example:
+// Workflow on operator_zone ENTERS C/D:
+//   1) lock (single instance)
+//   2) stop RMS poller service (exclusive VSE access)
+//   3) pre-FFT quick RMS window (raw stream -> RMS)
+//   4) raw capture for C1/C2 (+C3 if enabled)
+//   5) post-FFT quick RMS window
+//   6) write event marker JSON
+//   7) start RMS poller service
+//
+// Build (Mono):
 //   mcs -langversion:latest -out:build/fft_trigger_controller.exe \
 //       -r:../VSEUtilities_API.dll FFTTriggerController.cs
 //
-// Run example:
+// Run:
+//   export MONO_PATH=/home/sdc/yg/work/chiller/FFT/MyVSEProject
 //   export LD_LIBRARY_PATH=/home/sdc/yg/work/chiller/FFT/VSEUtilities_Linux/build-VSEUtilities_Linux/src/library:$LD_LIBRARY_PATH
 //   mono build/fft_trigger_controller.exe
-//
 
 using System;
 using System.IO;
@@ -43,7 +42,7 @@ public class FFTTriggerController
     // =========================
     // VERSION
     // =========================
-    private const string VERSION = "2.2.0";
+    private const string VERSION = "2.2.1";
 
     // =========================
     // VSE CONFIG (match RMS Poller v2.0.6)
@@ -56,7 +55,7 @@ public class FFTTriggerController
     private const short PortVse2 = 3321;
 
     // =========================
-    // INPUTS from v2.1.0 Operator Zone Engine
+    // INPUT: Operator Zone Engine v2.1.0
     // =========================
     private const string OperatorStatusJson =
         "/home/sdc/yg/chiller/ahm-runtime/operator_zone/operator_status.json";
@@ -68,41 +67,36 @@ public class FFTTriggerController
     private static readonly string LockDir = Path.Combine(RuntimeRoot, "lock");
     private static readonly string EventsDir = Path.Combine(RuntimeRoot, "events");
     private static readonly string FftRawRoot = Path.Combine(RuntimeRoot, "fft_raw");
+    private static readonly string StateFile = Path.Combine(RuntimeRoot, "controller_state.json");
     private static readonly string LockFile = Path.Combine(LockDir, "vse_exclusive.lock");
 
     // =========================
-    // EXCLUSIVE CONTROL OF RMS POLLER
+    // RMS POLLER SERVICE (exclusive control)
     // =========================
-    // IMPORTANT: set this to the real service name on AHM.
-    // Example: "ahm-rms-poller.service"
     private const string RmsPollerServiceName = "ahm-rms-poller.service";
 
     // =========================
     // TRIGGER RULES
     // =========================
-    // Trigger when operator_zone ENTERS C or D (persistence is upstream)
     private static readonly HashSet<string> TriggerZones =
         new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "C", "D" };
 
-    // Cooldown prevents retrigger spam if zone stays in C/D
     private const int CooldownSeconds = 10 * 60;
-
-    // Poll operator_status.json
     private const int PollIntervalMs = 1000;
 
     // =========================
     // PRE/POST quick read parameters
     // =========================
     private const int PrePostWindowMs = 2000;   // 2s sampling window
-    private const double RAW_TO_MMPS = 1.0;     // adjust if your raw scale already in mm/s
+    private const double RAW_TO_MMPS = 1.0;     // keep consistent with your existing RMS assumptions
     private const string OverallMode = "MAX_AXIS"; // "RSS" or "MAX_AXIS"
 
     // =========================
-    // FFT RAW CAPTURE parameters (align with your POC / production intent)
+    // FFT RAW CAPTURE parameters
     // =========================
-    private const int FftSampleRate = 100000;   // informational (raw capture)
-    private const int FftSampleSize = 131072;   // required sample count per axis
-    private const int FftDecimate = 2;
+    private const int FftSampleRate = 100000;   // informational
+    private const int FftSampleSize = 131072;   // required samples per axis
+    private const int FftTimeoutSeconds = 20;
 
     // =========================
     // VSE HANDLES
@@ -118,32 +112,8 @@ public class FFTTriggerController
     // =========================
     private static string _lastOperatorZone = "A";
     private static DateTime _lastTriggerUtc = DateTime.MinValue;
-
-    // =========================
-    // DATA STRUCTS (NO JObject)
-    // =========================
-    private struct RmsPack
-    {
-        public double RmsX;
-        public double RmsZ;
-        public double Overall;
-        public int N;
-    }
-
-    private struct QuickReadResult
-    {
-        public double Overall;
-        public RmsPack C1;
-        public RmsPack C2;
-        public RmsPack C3;
-    }
-
-    private class OperatorStatus
-    {
-        public string OperatorZone { get; set; }
-        public string InstantZone { get; set; }
-        public string StatusRowTs { get; set; }
-    }
+    private static string _lastSeenStatusRowTs = null;     // in-memory
+    private static string _lastProcessedStatusRowTs = null; // persisted
 
     public static int Main(string[] args)
     {
@@ -152,11 +122,12 @@ public class FFTTriggerController
         Console.WriteLine($"RuntimeRoot        : {RuntimeRoot}");
         Console.WriteLine($"EnableVse2         : {EnableVse2}");
         Console.WriteLine($"RmsPollerService   : {RmsPollerServiceName}");
-        Console.WriteLine($"FFT sampleSize     : {FftSampleSize}, decimate={FftDecimate}, fs={FftSampleRate}");
+        Console.WriteLine($"FFT sampleSize     : {FftSampleSize}, fs={FftSampleRate}");
+        Console.WriteLine($"StateFile          : {StateFile}");
 
         EnsureDirs();
+        LoadControllerState();
 
-        // Validate VSEUtilities loadability (libVSEUtilities.so must be visible via LD_LIBRARY_PATH)
         var check = ICore.checkInstanceValidity();
         if (!check.isOk())
         {
@@ -175,6 +146,24 @@ public class FFTTriggerController
                     continue;
                 }
 
+                // Only act on NEW status row timestamp (prevents spam)
+                if (!string.IsNullOrWhiteSpace(status.StatusRowTs))
+                {
+                    if (_lastSeenStatusRowTs == status.StatusRowTs)
+                    {
+                        Thread.Sleep(PollIntervalMs);
+                        continue;
+                    }
+                    _lastSeenStatusRowTs = status.StatusRowTs;
+
+                    // If we already processed this exact row before restart, ignore
+                    if (_lastProcessedStatusRowTs == status.StatusRowTs)
+                    {
+                        Thread.Sleep(PollIntervalMs);
+                        continue;
+                    }
+                }
+
                 string opZone = (status.OperatorZone ?? "A").Trim().ToUpperInvariant();
                 string instantZone = (status.InstantZone ?? "A").Trim().ToUpperInvariant();
 
@@ -185,9 +174,16 @@ public class FFTTriggerController
 
                 if (enteringTrigger && !inCooldown)
                 {
-                    Console.WriteLine($"[TRIGGER] operator_zone entered {opZone} (from {_lastOperatorZone}). Starting FFT workflow...");
+                    Console.WriteLine($"[TRIGGER] operator_zone entered {opZone} (from {_lastOperatorZone}).");
                     RunFftWorkflow(status, opZone, instantZone);
                     _lastTriggerUtc = DateTime.UtcNow;
+
+                    // mark this status_row_ts as processed (persist)
+                    if (!string.IsNullOrWhiteSpace(status.StatusRowTs))
+                    {
+                        _lastProcessedStatusRowTs = status.StatusRowTs;
+                        SaveControllerState();
+                    }
                 }
 
                 _lastOperatorZone = opZone;
@@ -216,20 +212,18 @@ public class FFTTriggerController
 
         try
         {
-            // 1) Acquire lock (prevents multiple instances from double-triggering)
             lockHandle = AcquireExclusiveLock();
 
-            // 2) Stop RMS poller to ensure exclusive VSE access
+            // stop RMS poller for exclusive VSE access
             Systemctl("stop", RmsPollerServiceName);
 
-            // 3) Pre-FFT overall read
+            // give systemd + device some time to release VSE
+            Thread.Sleep(1500);
+
             var pre = QuickOverallRead();
 
-            // 4) FFT capture raw samples
             var fftFiles = new List<string>();
-
-            string c1, c2;
-            if (CaptureFftVse1(dayDir, eventId, out c1, out c2))
+            if (CaptureFftVse1(dayDir, eventId, out var c1, out var c2))
             {
                 if (!string.IsNullOrEmpty(c1)) fftFiles.Add(c1);
                 if (!string.IsNullOrEmpty(c2)) fftFiles.Add(c2);
@@ -237,35 +231,42 @@ public class FFTTriggerController
 
             if (EnableVse2)
             {
-                string c3;
-                if (CaptureFftVse2(dayDir, eventId, out c3))
+                // VSE2 tends to need extra settle time between start/stop cycles
+                Thread.Sleep(1500);
+
+                if (CaptureFftVse2(dayDir, eventId, out var c3))
                 {
                     if (!string.IsNullOrEmpty(c3)) fftFiles.Add(c3);
                 }
             }
 
-            // 5) Post-FFT overall read
-            var post = QuickOverallRead();
+            // 5) Allow VSE firmware to settle after FFT
+            Thread.Sleep(2000);
 
-            // 6) Write event marker JSON (manual JSON, deterministic)
-            File.WriteAllText(eventJsonPath, BuildEventJson(eventId, status, opZone, instantZone, pre, post, fftFiles));
+            (double Overall, object C1, object C2, object C3) post;
+            try
+            {
+                post = QuickOverallRead();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[WARN] Post-FFT QuickOverallRead failed: " + ex.Message);
+                post = (0, null, null, null);
+            }
 
+
+            File.WriteAllText(eventJsonPath, BuildEventJson(eventId, opZone, instantZone, status.StatusRowTs, pre, post, fftFiles));
             Console.WriteLine("[EVENT] " + eventJsonPath);
-
-            // 7) Resume RMS poller
-            Systemctl("start", RmsPollerServiceName);
-
-            Console.WriteLine("[DONE] FFT workflow complete.");
         }
         catch (Exception ex)
         {
             Console.WriteLine("[WorkflowError] " + ex);
-
-            // best-effort: resume RMS poller
-            try { Systemctl("start", RmsPollerServiceName); } catch { }
         }
         finally
         {
+            // always try to restart RMS poller
+            try { Systemctl("start", RmsPollerServiceName); } catch { }
+
             SafeStopAll();
             try { lockHandle?.Dispose(); } catch { }
         }
@@ -273,11 +274,11 @@ public class FFTTriggerController
 
     private static string BuildEventJson(
         string eventId,
-        OperatorStatus status,
         string opZone,
         string instantZone,
-        QuickReadResult pre,
-        QuickReadResult post,
+        string statusRowTs,
+        (double Overall, object C1, object C2, object C3) pre,
+        (double Overall, object C1, object C2, object C3) post,
         List<string> fftFiles)
     {
         var sb = new StringBuilder(2048);
@@ -285,58 +286,30 @@ public class FFTTriggerController
         sb.AppendLine($"  \"ts\": \"{NowIsoLocal()}\",");
         sb.AppendLine($"  \"version\": \"{VERSION}\",");
         sb.AppendLine($"  \"event_id\": \"{eventId}\",");
-        sb.AppendLine($"  \"operator_zone\": \"{EscapeJson(opZone)}\",");
-        sb.AppendLine($"  \"instant_zone\": \"{EscapeJson(instantZone)}\",");
-        sb.AppendLine($"  \"status_row_ts\": \"{EscapeJson(status.StatusRowTs ?? "")}\",");
-
-        sb.AppendLine($"  \"pre_overall_mmps\": {Fmt(pre.Overall)},");
-        sb.AppendLine($"  \"post_overall_mmps\": {Fmt(post.Overall)},");
-
-        sb.AppendLine("  \"pre\": {");
-        sb.AppendLine($"    \"c1\": {RmsPackJson(pre.C1)},");
-        sb.AppendLine($"    \"c2\": {RmsPackJson(pre.C2)},");
-        sb.AppendLine($"    \"c3\": {RmsPackJson(pre.C3)}");
-        sb.AppendLine("  },");
-
-        sb.AppendLine("  \"post\": {");
-        sb.AppendLine($"    \"c1\": {RmsPackJson(post.C1)},");
-        sb.AppendLine($"    \"c2\": {RmsPackJson(post.C2)},");
-        sb.AppendLine($"    \"c3\": {RmsPackJson(post.C3)}");
-        sb.AppendLine("  },");
-
+        sb.AppendLine($"  \"operator_zone\": \"{opZone}\",");
+        sb.AppendLine($"  \"instant_zone\": \"{instantZone}\",");
+        sb.AppendLine($"  \"status_row_ts\": \"{Escape(statusRowTs)}\",");
+        sb.AppendLine($"  \"pre_overall_mmps\": {pre.Overall.ToString("G10", CultureInfo.InvariantCulture)},");
+        sb.AppendLine($"  \"post_overall_mmps\": {post.Overall.ToString("G10", CultureInfo.InvariantCulture)},");
         sb.AppendLine("  \"fft_files\": [");
         for (int i = 0; i < fftFiles.Count; i++)
         {
-            sb.Append("    \"").Append(EscapeJson(fftFiles[i])).Append("\"");
+            sb.Append("    \"").Append(Escape(fftFiles[i])).Append("\"");
             if (i < fftFiles.Count - 1) sb.Append(",");
             sb.AppendLine();
         }
         sb.AppendLine("  ],");
-
         sb.AppendLine("  \"source\": \"ahm_local\"");
         sb.AppendLine("}");
         return sb.ToString();
     }
 
-    private static string RmsPackJson(RmsPack p)
-    {
-        return "{ " +
-               $"\"rms_x\": {Fmt(p.RmsX)}, " +
-               $"\"rms_z\": {Fmt(p.RmsZ)}, " +
-               $"\"overall\": {Fmt(p.Overall)}, " +
-               $"\"n\": {p.N}" +
-               " }";
-    }
-
     // =========================================================
-    // QUICK OVERALL READ (pre/post) — short RMS window
+    // QUICK OVERALL READ (pre/post) — NO writeToDevice()
     // =========================================================
-    private static QuickReadResult QuickOverallRead()
+    private static (double Overall, object C1, object C2, object C3) QuickOverallRead()
     {
         EnsureVseConnected();
-
-        // Configure “AnReSa” parameters (similar intent to RMS poller)
-        ConfigureVseForRead(decimate: 2);
 
         var untilUtc = DateTime.UtcNow.AddMilliseconds(PrePostWindowMs);
 
@@ -344,7 +317,7 @@ public class FFTTriggerController
         var bufC2 = new List<(float x, float z)>();
         var bufC3 = new List<(float x, float z)>();
 
-        // Start VSE1 stream
+        // VSE1 collector: 0..3 => C1(X,Z), C2(X,Z)
         var col1 = new RawCollector(
             onVse1: (s1, s2, s3, s4) =>
             {
@@ -358,9 +331,11 @@ public class FFTTriggerController
         if (!st1.isOk())
             throw new Exception("QuickOverallRead VSE1 start failed: " + st1.text());
 
-        // Start VSE2 stream (if enabled)
+        // VSE2 collector: 0..1 => C3(X,Z)
         if (EnableVse2 && _vse2 != null)
         {
+            Thread.Sleep(300); // small settle before opening VSE2 stream
+
             var col2 = new RawCollector(
                 onVse1: null,
                 onVse2: (s1, s2) =>
@@ -372,7 +347,7 @@ public class FFTTriggerController
             var st2 = _rawVse2.start(_vse2, col2, null, null);
             if (!st2.isOk())
             {
-                Console.WriteLine("QuickOverallRead VSE2 start failed: " + st2.text());
+                Console.WriteLine("[INFO] Post-FFT QuickOverallRead VSE2 skipped (device settling)");
                 try { _rawVse2.stop(); } catch { }
                 _rawVse2 = null;
             }
@@ -389,22 +364,20 @@ public class FFTTriggerController
         var c3 = ComputeRms(bufC3);
 
         double overall = EnableVse2
-            ? Math.Max(c1.Overall, Math.Max(c2.Overall, c3.Overall))
-            : Math.Max(c1.Overall, c2.Overall);
+            ? Math.Max(c1.overall, Math.Max(c2.overall, c3.overall))
+            : Math.Max(c1.overall, c2.overall);
 
-        return new QuickReadResult
-        {
-            Overall = overall,
-            C1 = c1,
-            C2 = c2,
-            C3 = c3
-        };
+        object c1o = new { rms_x = c1.rmsX, rms_z = c1.rmsZ, overall = c1.overall, n = c1.n };
+        object c2o = new { rms_x = c2.rmsX, rms_z = c2.rmsZ, overall = c2.overall, n = c2.n };
+        object c3o = new { rms_x = c3.rmsX, rms_z = c3.rmsZ, overall = c3.overall, n = c3.n };
+
+        return (overall, c1o, c2o, c3o);
     }
 
-    private static RmsPack ComputeRms(List<(float x, float z)> buf)
+    private static (double rmsX, double rmsZ, double overall, int n) ComputeRms(List<(float x, float z)> buf)
     {
         if (buf == null || buf.Count < 5)
-            return new RmsPack { RmsX = 0, RmsZ = 0, Overall = 0, N = (buf == null ? 0 : buf.Count) };
+            return (0, 0, 0, buf?.Count ?? 0);
 
         double[] xs = buf.Select(p => (double)p.x).ToArray();
         double[] zs = buf.Select(p => (double)p.z).ToArray();
@@ -416,11 +389,11 @@ public class FFTTriggerController
             ? Math.Sqrt(rmsX * rmsX + rmsZ * rmsZ)
             : Math.Max(rmsX, rmsZ);
 
-        return new RmsPack { RmsX = rmsX, RmsZ = rmsZ, Overall = overall, N = buf.Count };
+        return (rmsX, rmsZ, overall, buf.Count);
     }
 
     // =========================================================
-    // FFT RAW CAPTURE
+    // FFT RAW CAPTURE — NO writeToDevice()
     // =========================================================
     private static bool CaptureFftVse1(string dayDir, string eventId, out string fileC1, out string fileC2)
     {
@@ -428,7 +401,6 @@ public class FFTTriggerController
         fileC2 = null;
 
         EnsureVseConnected();
-        ConfigureVseForRead(decimate: FftDecimate);
 
         var c1x = new List<float>(FftSampleSize);
         var c1z = new List<float>(FftSampleSize);
@@ -455,7 +427,7 @@ public class FFTTriggerController
         }
 
         var startUtc = DateTime.UtcNow;
-        while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < 15)
+        while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
 
         try { _rawVse1.stop(); } catch { }
@@ -485,8 +457,6 @@ public class FFTTriggerController
         EnsureVseConnected();
         if (_vse2 == null) return false;
 
-        ConfigureVseForRead(decimate: FftDecimate);
-
         var c3x = new List<float>(FftSampleSize);
         var c3z = new List<float>(FftSampleSize);
 
@@ -509,7 +479,7 @@ public class FFTTriggerController
         }
 
         var startUtc = DateTime.UtcNow;
-        while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < 15)
+        while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
 
         try { _rawVse2.stop(); } catch { }
@@ -542,56 +512,7 @@ public class FFTTriggerController
     }
 
     // =========================================================
-    // VSE PARAMS (match RMS “style”: HP2Hz + IEPE)
-    // =========================================================
-    private static void ConfigureVseForRead(int decimate)
-    {
-        // VSE1 uses sensor[0..3]
-        var p1 = BuildParams_HP2Hz_IEPE(decimate: decimate, use0123: true);
-        var wr1 = p1.writeToDevice(_vse1);
-        if (!wr1.isOk()) throw new Exception("VSE1 params write failed: " + wr1.text());
-
-        if (EnableVse2 && _vse2 != null)
-        {
-            // VSE2 uses sensor[0..1]
-            var p2 = BuildParams_HP2Hz_IEPE(decimate: decimate, use0123: false);
-            var wr2 = p2.writeToDevice(_vse2);
-            if (!wr2.isOk()) Console.WriteLine("VSE2 params write failed: " + wr2.text());
-        }
-    }
-
-    private static IParametersAnReSa BuildParams_HP2Hz_IEPE(int decimate, bool use0123)
-    {
-        var setup = new IParametersAnReSa.Setup();
-
-        // Default: configure 0..3 as HP2Hz + IEPE
-        for (int i = 0; i < 4; i++)
-        {
-            setup.sensor[i].mode = IParametersAnReSa.Setup.Sensor.Mode.HP2Hz;
-            setup.sensor[i].scale = 490.5f;
-            setup.sensor[i].offset = 0;
-            setup.sensor[i].isIEPE = true;
-        }
-
-        if (!use0123)
-        {
-            // for VSE2: only 0..1 on; 2..3 off
-            setup.sensor[2].mode = IParametersAnReSa.Setup.Sensor.Mode.Off;
-            setup.sensor[3].mode = IParametersAnReSa.Setup.Sensor.Mode.Off;
-        }
-
-        if (decimate < 1 || decimate > 255)
-            throw new ArgumentOutOfRangeException(nameof(decimate), "decimate must be 1..255");
-
-        setup.decimate = (byte)decimate;
-
-        var parameters = IParametersAnReSa.create();
-        parameters.setup(setup);
-        return parameters;
-    }
-
-    // =========================================================
-    // VSE CONNECTION / STOP
+    // VSE CONNECTION
     // =========================================================
     private static void EnsureVseConnected()
     {
@@ -631,7 +552,7 @@ public class FFTTriggerController
     }
 
     // =========================================================
-    // OPERATOR STATUS READER (manual JSON key extraction)
+    // OPERATOR STATUS READER (simple JSON string extract, Mono-friendly)
     // =========================================================
     private static OperatorStatus TryReadOperatorStatus()
     {
@@ -644,13 +565,13 @@ public class FFTTriggerController
 
             string op = ExtractJsonValue(json, "operator_zone") ?? "A";
             string instant = ExtractJsonValue(json, "instant_zone") ?? "A";
-            string ts = ExtractJsonValue(json, "status_row_ts");
+            string srt = ExtractJsonValue(json, "status_row_ts");
 
             return new OperatorStatus
             {
                 OperatorZone = op,
                 InstantZone = instant,
-                StatusRowTs = ts
+                StatusRowTs = srt
             };
         }
         catch
@@ -661,22 +582,59 @@ public class FFTTriggerController
 
     private static string ExtractJsonValue(string json, string key)
     {
-        // Very small deterministic extractor for:  "key": "value"
         string token = $"\"{key}\"";
-        int idx = json.IndexOf(token, StringComparison.Ordinal);
+        int idx = json.IndexOf(token);
         if (idx < 0) return null;
 
         int colon = json.IndexOf(':', idx);
         if (colon < 0) return null;
 
-        int startQuote = json.IndexOf('"', colon + 1);
-        if (startQuote < 0) return null;
+        // find first quote after colon
+        int q1 = json.IndexOf('"', colon + 1);
+        if (q1 < 0) return null;
+        int q2 = json.IndexOf('"', q1 + 1);
+        if (q2 < 0) return null;
 
-        int start = startQuote + 1;
-        int end = json.IndexOf('"', start);
-        if (end < 0) return null;
+        return json.Substring(q1 + 1, q2 - (q1 + 1));
+    }
 
-        return json.Substring(start, end - start);
+    private class OperatorStatus
+    {
+        public string OperatorZone { get; set; }
+        public string InstantZone { get; set; }
+        public string StatusRowTs { get; set; }
+    }
+
+    // =========================================================
+    // PERSISTED CONTROLLER STATE
+    // =========================================================
+    private static void LoadControllerState()
+    {
+        try
+        {
+            if (!File.Exists(StateFile)) return;
+            var json = File.ReadAllText(StateFile);
+            _lastProcessedStatusRowTs = ExtractJsonValue(json, "last_processed_status_row_ts");
+            var lastZone = ExtractJsonValue(json, "last_operator_zone");
+            if (!string.IsNullOrWhiteSpace(lastZone)) _lastOperatorZone = lastZone.Trim().ToUpperInvariant();
+            Console.WriteLine($"[STATE] last_processed_status_row_ts={_lastProcessedStatusRowTs}, last_operator_zone={_lastOperatorZone}");
+        }
+        catch { }
+    }
+
+    private static void SaveControllerState()
+    {
+        try
+        {
+            var sb = new StringBuilder(256);
+            sb.AppendLine("{");
+            sb.AppendLine($"  \"ts\": \"{NowIsoLocal()}\",");
+            sb.AppendLine($"  \"last_processed_status_row_ts\": \"{Escape(_lastProcessedStatusRowTs)}\",");
+            sb.AppendLine($"  \"last_operator_zone\": \"{Escape(_lastOperatorZone)}\"");
+            sb.AppendLine("}");
+            File.WriteAllText(StateFile, sb.ToString());
+        }
+        catch { }
     }
 
     // =========================================================
@@ -734,15 +692,10 @@ public class FFTTriggerController
         return DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss+08:00");
     }
 
-    private static string EscapeJson(string s)
+    private static string Escape(string s)
     {
-        if (s == null) return "";
+        if (string.IsNullOrEmpty(s)) return "";
         return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
-    }
-
-    private static string Fmt(double v)
-    {
-        return v.ToString("G12", CultureInfo.InvariantCulture);
     }
 
     // =========================================================
