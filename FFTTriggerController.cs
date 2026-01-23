@@ -652,6 +652,8 @@ public class FFTTriggerController
     private static void Systemctl(string action, string serviceName)
     {
         RunCmd("/bin/systemctl", $"{action} {serviceName}");
+        //RunCmd("/usr/bin/sudo", $"-n /bin/systemctl {action} {serviceName}");
+
     }
 
     private static void RunCmd(string file, string args)
