@@ -42,7 +42,7 @@ public class FFTTriggerController
     // =========================
     // VERSION
     // =========================
-    private const string VERSION = "2.2.1";
+    private const string VERSION = "2.2.2";
 
     // =========================
     // VSE CONFIG (match RMS Poller v2.0.6)
@@ -98,7 +98,14 @@ public class FFTTriggerController
     private const int FftSampleSize = 131072;   // required samples per axis
     private const int FftTimeoutSeconds = 20;
 
-    // =========================
+    
+// =========================
+// START/STOP HARDENING
+// =========================
+private const int StartRetryCount = 3;
+private const int StartRetryDelayMs = 600;
+private const int AfterStopSettleMs = 600;
+// =========================
     // VSE HANDLES
     // =========================
     private static IVse _vse1;
@@ -217,9 +224,12 @@ public class FFTTriggerController
             // stop RMS poller for exclusive VSE access
             Systemctl("stop", RmsPollerServiceName);
 
-            // give systemd + device some time to release VSE
-            Thread.Sleep(1500);
+// Wait until RMS poller is really inactive (avoid VSE handle still held)
+WaitServiceInactive(RmsPollerServiceName, 8000);
 
+// Ensure THIS controller has a clean slate too (no stale raw streams / sockets)
+SafeStopAll();
+Thread.Sleep(AfterStopSettleMs);
             var pre = QuickOverallRead();
 
             var fftFiles = new List<string>();
@@ -327,10 +337,13 @@ public class FFTTriggerController
             onVse2: null);
 
         _rawVse1 = new IRawDataAnReSa();
-        var st1 = _rawVse1.start(_vse1, col1, null, null);
-        if (!st1.isOk())
-            throw new Exception("QuickOverallRead VSE1 start failed: " + st1.text());
-
+bool ok1 = StartRawWithRetry(
+    "[QuickOverallRead] VSE1",
+    startFunc: () => _rawVse1.start(_vse1, col1, null, null),
+    stopFunc: () => { try { _rawVse1.stop(); } catch { } },
+    reconnectFunc: () => { SafeStopAll(); EnsureVseConnected(); }
+);
+if (!ok1) throw new Exception("QuickOverallRead VSE1 start failed after retries.");
         // VSE2 collector: 0..1 => C3(X,Z)
         if (EnableVse2 && _vse2 != null)
         {
@@ -344,20 +357,31 @@ public class FFTTriggerController
                 });
 
             _rawVse2 = new IRawDataAnReSa();
-            var st2 = _rawVse2.start(_vse2, col2, null, null);
-            if (!st2.isOk())
-            {
-                Console.WriteLine("[INFO] Post-FFT QuickOverallRead VSE2 skipped (device settling)");
-                try { _rawVse2.stop(); } catch { }
-                _rawVse2 = null;
-            }
+bool ok2 = StartRawWithRetry(
+    "[QuickOverallRead] VSE2",
+    startFunc: () => _rawVse2.start(_vse2, col2, null, null),
+    stopFunc: () => { try { _rawVse2.stop(); } catch { } },
+    reconnectFunc: () => { try { _vse2?.disconnect(); } catch { } _vse2 = null; EnsureVseConnected(); }
+);
+if (!ok2)
+{
+    Console.WriteLine("[INFO] Post-FFT QuickOverallRead VSE2 skipped (device settling)");
+    try { _rawVse2.stop(); } catch { }
+        _rawVse2 = null;
+        Thread.Sleep(AfterStopSettleMs);
+
+    _rawVse2 = null;
+}
         }
 
         while (DateTime.UtcNow < untilUtc)
             Thread.Sleep(20);
 
         try { _rawVse1?.stop(); } catch { }
+        _rawVse1 = null;
         try { _rawVse2?.stop(); } catch { }
+        _rawVse2 = null;
+        Thread.Sleep(AfterStopSettleMs);
 
         var c1 = ComputeRms(bufC1);
         var c2 = ComputeRms(bufC2);
@@ -419,18 +443,24 @@ public class FFTTriggerController
             onVse2: null);
 
         _rawVse1 = new IRawDataAnReSa();
-        var st = _rawVse1.start(_vse1, col, null, null);
-        if (!st.isOk())
-        {
-            Console.WriteLine("FFT VSE1 start failed: " + st.text());
-            return false;
-        }
-
+bool ok = StartRawWithRetry(
+    "[FFT] VSE1",
+    startFunc: () => _rawVse1.start(_vse1, col, null, null),
+    stopFunc: () => { try { _rawVse1.stop(); } catch { } },
+    reconnectFunc: () => { SafeStopAll(); EnsureVseConnected(); }
+);
+if (!ok)
+{
+    Console.WriteLine("FFT VSE1 start failed after retries.");
+    return false;
+}
         var startUtc = DateTime.UtcNow;
         while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
 
         try { _rawVse1.stop(); } catch { }
+        _rawVse1 = null;
+        Thread.Sleep(AfterStopSettleMs);
 
         if (!done)
         {
@@ -471,13 +501,17 @@ public class FFTTriggerController
             });
 
         _rawVse2 = new IRawDataAnReSa();
-        var st = _rawVse2.start(_vse2, col, null, null);
-        if (!st.isOk())
-        {
-            Console.WriteLine("FFT VSE2 start failed: " + st.text());
-            return false;
-        }
-
+bool ok = StartRawWithRetry(
+    "[FFT] VSE2",
+    startFunc: () => _rawVse2.start(_vse2, col, null, null),
+    stopFunc: () => { try { _rawVse2.stop(); } catch { } },
+    reconnectFunc: () => { try { _vse2?.disconnect(); } catch { } _vse2 = null; EnsureVseConnected(); }
+);
+if (!ok)
+{
+    Console.WriteLine("FFT VSE2 start failed after retries.");
+    return false;
+}
         var startUtc = DateTime.UtcNow;
         while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
@@ -646,7 +680,101 @@ public class FFTTriggerController
         return new FileStream(LockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
     }
 
-    // =========================================================
+    
+// =========================================================
+// SERVICE WAIT / START RETRIES
+// =========================================================
+private static void WaitServiceInactive(string serviceName, int timeoutMs)
+{
+    var until = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+    while (DateTime.UtcNow < until)
+    {
+        try
+        {
+            // systemctl is-active exits 0 when active; non-zero otherwise
+            var p = new Process();
+            p.StartInfo.FileName = "/bin/systemctl";
+            p.StartInfo.Arguments = $"is-active {serviceName}";
+            p.StartInfo.RedirectStandardOutput = true;
+            p.StartInfo.RedirectStandardError = true;
+            p.StartInfo.UseShellExecute = false;
+            p.StartInfo.CreateNoWindow = true;
+            p.Start();
+            string o = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit();
+            if (!string.Equals(o, "active", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(o, "activating", StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+        catch
+        {
+            return; // best effort
+        }
+
+        Thread.Sleep(200);
+    }
+    Console.WriteLine($"[WARN] Timeout waiting service inactive: {serviceName}");
+}
+
+
+private static bool StatusIsOk(object st)
+{
+    if (st == null) return false;
+    try
+    {
+        var m = st.GetType().GetMethod("isOk", Type.EmptyTypes);
+        if (m != null && m.ReturnType == typeof(bool))
+            return (bool)m.Invoke(st, null);
+    }
+    catch { }
+    return false;
+}
+
+private static string StatusText(object st)
+{
+    if (st == null) return "(null status)";
+    try
+    {
+        var m = st.GetType().GetMethod("text", Type.EmptyTypes);
+        if (m != null)
+        {
+            var v = m.Invoke(st, null);
+            return v?.ToString() ?? "(null text)";
+        }
+    }
+    catch { }
+    return st.ToString();
+}
+
+private static bool StartRawWithRetry(string tag, Func<object> startFunc, Action stopFunc = null, Action reconnectFunc = null)
+{
+    for (int attempt = 1; attempt <= StartRetryCount; attempt++)
+    {
+        try
+        {
+            var st = startFunc();
+            if (StatusIsOk(st))
+                return true;
+
+            string msg = StatusText(st);
+            Console.WriteLine($"{tag} start failed (attempt {attempt}/{StartRetryCount}): {msg}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"{tag} start exception (attempt {attempt}/{StartRetryCount}): {ex.Message}");
+        }
+
+        // stop any partial stream
+        try { stopFunc?.Invoke(); } catch { }
+
+        // reconnect VSE socket if provided
+        try { reconnectFunc?.Invoke(); } catch { }
+
+        Thread.Sleep(StartRetryDelayMs);
+    }
+    return false;
+}
+// =========================================================
     // SYSTEMD CONTROL
     // =========================================================
     private static void Systemctl(string action, string serviceName)
