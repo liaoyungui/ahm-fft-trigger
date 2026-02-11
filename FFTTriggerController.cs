@@ -1,9 +1,9 @@
 // FFTTriggerController.cs
 //
-// AHM FFT Trigger Controller (v2.2.1) — RULE ONLY / HARDENED
+// AHM FFT Trigger Controller (v2.2.5) — RULE ONLY / HARDENED
 //
 // Key hardening vs v2.2.0:
-// - Avoids IParametersAnReSa.writeToDevice() (can native-abort in libVSEUtilities.so)
+// - Applies IParametersAnReSa.writeToDevice() with same HP2Hz/scale/decimate as RMS poller (keeps raw waveform in expected units)
 // - Triggers only on new status_row_ts (no spam when operator_status.json updates frequently)
 // - Persists controller state to disk (survive restart without retriggering same row)
 // - Keeps workflow deterministic/offline-first
@@ -42,10 +42,10 @@ public class FFTTriggerController
     // =========================
     // VERSION
     // =========================
-    private const string VERSION = "2.2.2";
+    private const string VERSION = "2.2.5";
 
     // =========================
-    // VSE CONFIG (match RMS Poller v2.0.6)
+    // VSE CONFIG (match RMS Poller v2.0.8 / baseline HP2Hz+490.5+decimate2)
     // =========================
     private const string IpVse1 = "192.168.1.101";
     private const short PortVse1 = 3321;
@@ -98,14 +98,74 @@ public class FFTTriggerController
     private const int FftSampleSize = 131072;   // required samples per axis
     private const int FftTimeoutSeconds = 20;
 
-    
-// =========================
-// START/STOP HARDENING
-// =========================
-private const int StartRetryCount = 3;
-private const int StartRetryDelayMs = 600;
-private const int AfterStopSettleMs = 600;
-// =========================
+
+    // =========================
+    // VSE Parameter setup (match RMS poller / FFTChiller baseline)
+    // Raw stream returns acceleration in "g" when scale=490.5 & HP2Hz
+    // =========================
+    private const float SENSOR_SCALE = 490.5f;
+    private static IParametersAnReSa BuildParamsForFftVse1()
+    {
+        var setup = new IParametersAnReSa.Setup();
+        // VSE1 delivers 4 channels: C1(X,Z)=0..1, C2(X,Z)=2..3
+        for (int i = 0; i < 4; i++)
+        {
+            setup.sensor[i].mode = IParametersAnReSa.Setup.Sensor.Mode.HP2Hz;
+            setup.sensor[i].scale = SENSOR_SCALE;
+            setup.sensor[i].offset = 0;
+            setup.sensor[i].isIEPE = true;
+        }
+        setup.decimate = 2;
+        var p = IParametersAnReSa.create();
+        p.setup(setup);
+        return p;
+    }
+
+    private static IParametersAnReSa BuildParamsForFftVse2()
+    {
+        var setup = new IParametersAnReSa.Setup();
+        // VSE2 delivers 2 channels: C3(X,Z)=0..1
+        setup.sensor[0].mode = IParametersAnReSa.Setup.Sensor.Mode.HP2Hz;
+        setup.sensor[0].scale = SENSOR_SCALE;
+        setup.sensor[0].offset = 0;
+        setup.sensor[0].isIEPE = true;
+
+        setup.sensor[1].mode = IParametersAnReSa.Setup.Sensor.Mode.HP2Hz;
+        setup.sensor[1].scale = SENSOR_SCALE;
+        setup.sensor[1].offset = 0;
+        setup.sensor[1].isIEPE = true;
+
+        setup.sensor[2].mode = IParametersAnReSa.Setup.Sensor.Mode.Off;
+        setup.sensor[3].mode = IParametersAnReSa.Setup.Sensor.Mode.Off;
+
+        setup.decimate = 2;
+        var p = IParametersAnReSa.create();
+        p.setup(setup);
+        return p;
+    }
+
+    private static bool TryApplyParams(IVse vse, IParametersAnReSa parameters, string tag)
+    {
+        if (vse == null || parameters == null) return false;
+        try
+        {
+            var st = parameters.writeToDevice(vse);
+            if (!st.isOk())
+            {
+                Console.WriteLine($"[PARAM] {tag} writeToDevice failed: {st.text()}");
+                return false;
+            }
+            Console.WriteLine($"[PARAM] {tag} writeToDevice OK");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[PARAM] {tag} writeToDevice exception: {ex.Message}");
+            return false;
+        }
+    }
+
+    // =========================
     // VSE HANDLES
     // =========================
     private static IVse _vse1;
@@ -224,12 +284,9 @@ private const int AfterStopSettleMs = 600;
             // stop RMS poller for exclusive VSE access
             Systemctl("stop", RmsPollerServiceName);
 
-// Wait until RMS poller is really inactive (avoid VSE handle still held)
-WaitServiceInactive(RmsPollerServiceName, 8000);
+            // give systemd + device some time to release VSE
+            Thread.Sleep(1500);
 
-// Ensure THIS controller has a clean slate too (no stale raw streams / sockets)
-SafeStopAll();
-Thread.Sleep(AfterStopSettleMs);
             var pre = QuickOverallRead();
 
             var fftFiles = new List<string>();
@@ -336,14 +393,14 @@ Thread.Sleep(AfterStopSettleMs);
             },
             onVse2: null);
 
+        // Ensure VSE1 is in the expected mode for QuickOverallRead as well
+        TryApplyParams(_vse1, BuildParamsForFftVse1(), "VSE1-QuickOverall");
+
         _rawVse1 = new IRawDataAnReSa();
-bool ok1 = StartRawWithRetry(
-    "[QuickOverallRead] VSE1",
-    startFunc: () => _rawVse1.start(_vse1, col1, null, null),
-    stopFunc: () => { try { _rawVse1.stop(); } catch { } },
-    reconnectFunc: () => { SafeStopAll(); EnsureVseConnected(); }
-);
-if (!ok1) throw new Exception("QuickOverallRead VSE1 start failed after retries.");
+        var st1 = _rawVse1.start(_vse1, col1, null, null);
+        if (!st1.isOk())
+            throw new Exception("QuickOverallRead VSE1 start failed: " + st1.text());
+
         // VSE2 collector: 0..1 => C3(X,Z)
         if (EnableVse2 && _vse2 != null)
         {
@@ -356,32 +413,24 @@ if (!ok1) throw new Exception("QuickOverallRead VSE1 start failed after retries.
                     bufC3.Add((s1, s2));
                 });
 
-            _rawVse2 = new IRawDataAnReSa();
-bool ok2 = StartRawWithRetry(
-    "[QuickOverallRead] VSE2",
-    startFunc: () => _rawVse2.start(_vse2, col2, null, null),
-    stopFunc: () => { try { _rawVse2.stop(); } catch { } },
-    reconnectFunc: () => { try { _vse2?.disconnect(); } catch { } _vse2 = null; EnsureVseConnected(); }
-);
-if (!ok2)
-{
-    Console.WriteLine("[INFO] Post-FFT QuickOverallRead VSE2 skipped (device settling)");
-    try { _rawVse2.stop(); } catch { }
-        _rawVse2 = null;
-        Thread.Sleep(AfterStopSettleMs);
+            // Ensure VSE2 is in the expected mode for QuickOverallRead as well
+            TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-QuickOverall");
 
-    _rawVse2 = null;
-}
+            _rawVse2 = new IRawDataAnReSa();
+            var st2 = _rawVse2.start(_vse2, col2, null, null);
+            if (!st2.isOk())
+            {
+                Console.WriteLine("[INFO] Post-FFT QuickOverallRead VSE2 skipped (device settling)");
+                try { _rawVse2.stop(); } catch { }
+                _rawVse2 = null;
+            }
         }
 
         while (DateTime.UtcNow < untilUtc)
             Thread.Sleep(20);
 
         try { _rawVse1?.stop(); } catch { }
-        _rawVse1 = null;
         try { _rawVse2?.stop(); } catch { }
-        _rawVse2 = null;
-        Thread.Sleep(AfterStopSettleMs);
 
         var c1 = ComputeRms(bufC1);
         var c2 = ComputeRms(bufC2);
@@ -426,6 +475,9 @@ if (!ok2)
 
         EnsureVseConnected();
 
+        // Ensure VSE1 is in the expected capture mode (HP2Hz, scale 490.5, decimate 2)
+        TryApplyParams(_vse1, BuildParamsForFftVse1(), "VSE1-FFT");
+
         var c1x = new List<float>(FftSampleSize);
         var c1z = new List<float>(FftSampleSize);
         var c2x = new List<float>(FftSampleSize);
@@ -443,24 +495,18 @@ if (!ok2)
             onVse2: null);
 
         _rawVse1 = new IRawDataAnReSa();
-bool ok = StartRawWithRetry(
-    "[FFT] VSE1",
-    startFunc: () => _rawVse1.start(_vse1, col, null, null),
-    stopFunc: () => { try { _rawVse1.stop(); } catch { } },
-    reconnectFunc: () => { SafeStopAll(); EnsureVseConnected(); }
-);
-if (!ok)
-{
-    Console.WriteLine("FFT VSE1 start failed after retries.");
-    return false;
-}
+        var st = _rawVse1.start(_vse1, col, null, null);
+        if (!st.isOk())
+        {
+            Console.WriteLine("FFT VSE1 start failed: " + st.text());
+            return false;
+        }
+
         var startUtc = DateTime.UtcNow;
         while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
 
         try { _rawVse1.stop(); } catch { }
-        _rawVse1 = null;
-        Thread.Sleep(AfterStopSettleMs);
 
         if (!done)
         {
@@ -487,6 +533,9 @@ if (!ok)
         EnsureVseConnected();
         if (_vse2 == null) return false;
 
+        // Ensure VSE2 is in the expected capture mode (HP2Hz, scale 490.5, decimate 2)
+        TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
+
         var c3x = new List<float>(FftSampleSize);
         var c3z = new List<float>(FftSampleSize);
 
@@ -501,17 +550,39 @@ if (!ok)
             });
 
         _rawVse2 = new IRawDataAnReSa();
-bool ok = StartRawWithRetry(
-    "[FFT] VSE2",
-    startFunc: () => _rawVse2.start(_vse2, col, null, null),
-    stopFunc: () => { try { _rawVse2.stop(); } catch { } },
-    reconnectFunc: () => { try { _vse2?.disconnect(); } catch { } _vse2 = null; EnsureVseConnected(); }
-);
-if (!ok)
-{
-    Console.WriteLine("FFT VSE2 start failed after retries.");
-    return false;
-}
+        bool started = false;
+        string lastErr = "";
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try { if (_rawVse2 != null) _rawVse2.stop(); } catch { }
+            _rawVse2 = new IRawDataAnReSa();
+
+            // After writeToDevice(), VSE2 may need a short settle before starting raw stream
+            Thread.Sleep(1200);
+
+            var st = _rawVse2.start(_vse2, col, null, null);
+            if (st.isOk()) { started = true; break; }
+
+            lastErr = st.text();
+            Console.WriteLine(string.Format("FFT VSE2 start failed (attempt {0}/3): {1}", attempt, lastErr));
+
+            // Reconnect VSE2 and re-apply params before retry
+            try { _vse2.disconnect(); } catch { }
+            _vse2 = null;
+            EnsureVseConnected();
+            if (_vse2 == null)
+            {
+                Thread.Sleep(500);
+                continue;
+            }
+            TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
+        }
+
+        if (!started)
+        {
+            Console.WriteLine("FFT VSE2 start failed: " + lastErr);
+            return false;
+        }
         var startUtc = DateTime.UtcNow;
         while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
@@ -570,7 +641,40 @@ if (!ok)
         }
     }
 
-    private static void SafeStopAll()
+    
+    private static void ReconnectVse2()
+    {
+        if (!EnableVse2) return;
+
+        try { _rawVse2?.stop(); } catch { }
+        _rawVse2 = null;
+
+        try { _vse2?.disconnect(); } catch { }
+        _vse2 = null;
+
+        // small settle before reconnect
+        Thread.Sleep(500);
+
+        try
+        {
+            _vse2 = new IVse();
+            var conn = _vse2.connect(IpVse2, PortVse2);
+            if (!conn.isOk())
+            {
+                Console.WriteLine("VSE2 reconnect failed: " + conn.text());
+                try { _vse2.disconnect(); } catch { }
+                _vse2 = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("VSE2 reconnect exception: " + ex.Message);
+            try { _vse2?.disconnect(); } catch { }
+            _vse2 = null;
+        }
+    }
+
+private static void SafeStopAll()
     {
         try { _rawVse1?.stop(); } catch { }
         _rawVse1 = null;
@@ -680,101 +784,7 @@ if (!ok)
         return new FileStream(LockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
     }
 
-    
-// =========================================================
-// SERVICE WAIT / START RETRIES
-// =========================================================
-private static void WaitServiceInactive(string serviceName, int timeoutMs)
-{
-    var until = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-    while (DateTime.UtcNow < until)
-    {
-        try
-        {
-            // systemctl is-active exits 0 when active; non-zero otherwise
-            var p = new Process();
-            p.StartInfo.FileName = "/bin/systemctl";
-            p.StartInfo.Arguments = $"is-active {serviceName}";
-            p.StartInfo.RedirectStandardOutput = true;
-            p.StartInfo.RedirectStandardError = true;
-            p.StartInfo.UseShellExecute = false;
-            p.StartInfo.CreateNoWindow = true;
-            p.Start();
-            string o = p.StandardOutput.ReadToEnd().Trim();
-            p.WaitForExit();
-            if (!string.Equals(o, "active", StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(o, "activating", StringComparison.OrdinalIgnoreCase))
-                return;
-        }
-        catch
-        {
-            return; // best effort
-        }
-
-        Thread.Sleep(200);
-    }
-    Console.WriteLine($"[WARN] Timeout waiting service inactive: {serviceName}");
-}
-
-
-private static bool StatusIsOk(object st)
-{
-    if (st == null) return false;
-    try
-    {
-        var m = st.GetType().GetMethod("isOk", Type.EmptyTypes);
-        if (m != null && m.ReturnType == typeof(bool))
-            return (bool)m.Invoke(st, null);
-    }
-    catch { }
-    return false;
-}
-
-private static string StatusText(object st)
-{
-    if (st == null) return "(null status)";
-    try
-    {
-        var m = st.GetType().GetMethod("text", Type.EmptyTypes);
-        if (m != null)
-        {
-            var v = m.Invoke(st, null);
-            return v?.ToString() ?? "(null text)";
-        }
-    }
-    catch { }
-    return st.ToString();
-}
-
-private static bool StartRawWithRetry(string tag, Func<object> startFunc, Action stopFunc = null, Action reconnectFunc = null)
-{
-    for (int attempt = 1; attempt <= StartRetryCount; attempt++)
-    {
-        try
-        {
-            var st = startFunc();
-            if (StatusIsOk(st))
-                return true;
-
-            string msg = StatusText(st);
-            Console.WriteLine($"{tag} start failed (attempt {attempt}/{StartRetryCount}): {msg}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"{tag} start exception (attempt {attempt}/{StartRetryCount}): {ex.Message}");
-        }
-
-        // stop any partial stream
-        try { stopFunc?.Invoke(); } catch { }
-
-        // reconnect VSE socket if provided
-        try { reconnectFunc?.Invoke(); } catch { }
-
-        Thread.Sleep(StartRetryDelayMs);
-    }
-    return false;
-}
-// =========================================================
+    // =========================================================
     // SYSTEMD CONTROL
     // =========================================================
     private static void Systemctl(string action, string serviceName)
