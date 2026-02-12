@@ -42,7 +42,7 @@ public class FFTTriggerController
     // =========================
     // VERSION
     // =========================
-    private const string VERSION = "2.2.5";
+    private const string VERSION = "2.2.6";
 
     // =========================
     // VSE CONFIG (match RMS Poller v2.0.8 / baseline HP2Hz+490.5+decimate2)
@@ -308,9 +308,22 @@ public class FFTTriggerController
             }
 
             // 5) Allow VSE firmware to settle after FFT
-            Thread.Sleep(2000);
+            Thread.Sleep(1500);
 
-            (double Overall, object C1, object C2, object C3) post;
+            // HARDEN: after FFT cycles, reconnect to avoid rare native assert in libVSEUtilities (firmwareVersion)
+            try
+            {
+                ReconnectVse1();
+                if (EnableVse2) ReconnectVse2();
+                Thread.Sleep(800);
+            }
+            catch (Exception rex)
+            {
+                Console.WriteLine("[WARN] Reconnect after FFT failed: " + rex.Message);
+                // proceed; QuickOverallRead will attempt EnsureVseConnected again
+            }
+
+(double Overall, object C1, object C2, object C3) post;
             try
             {
                 post = QuickOverallRead();
@@ -642,7 +655,24 @@ public class FFTTriggerController
     }
 
     
-    private static void ReconnectVse2()
+    
+    private static void ReconnectVse1()
+    {
+        try { _rawVse1?.stop(); } catch { }
+        _rawVse1 = null;
+
+        try { _vse1?.disconnect(); } catch { }
+        _vse1 = null;
+
+        // small settle before reconnect
+        Thread.Sleep(500);
+
+        _vse1 = new IVse();
+        var conn = _vse1.connect(IpVse1, PortVse1);
+        if (!conn.isOk()) throw new Exception("VSE1 reconnect failed: " + conn.text());
+    }
+
+private static void ReconnectVse2()
     {
         if (!EnableVse2) return;
 
