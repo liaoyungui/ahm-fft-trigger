@@ -42,7 +42,7 @@ public class FFTTriggerController
     // =========================
     // VERSION
     // =========================
-    private const string VERSION = "2.2.6";
+    private const string VERSION = "2.2.7";
 
     // =========================
     // VSE CONFIG (match RMS Poller v2.0.8 / baseline HP2Hz+490.5+decimate2)
@@ -289,41 +289,52 @@ public class FFTTriggerController
 
             var pre = QuickOverallRead();
 
-            var fftFiles = new List<string>();
-            if (CaptureFftVse1(dayDir, eventId, out var c1, out var c2))
-            {
-                if (!string.IsNullOrEmpty(c1)) fftFiles.Add(c1);
-                if (!string.IsNullOrEmpty(c2)) fftFiles.Add(c2);
-            }
+            
 
-            if (EnableVse2)
-            {
-                // VSE2 tends to need extra settle time between start/stop cycles
-                Thread.Sleep(1500);
+var fftFiles = new List<string>();
 
-                if (CaptureFftVse2(dayDir, eventId, out var c3))
-                {
-                    if (!string.IsNullOrEmpty(c3)) fftFiles.Add(c3);
-                }
-            }
+// STRICT: wait for BOTH VSE1 and VSE2 FFT to succeed (each retries up to 5 times).
+bool okVse1 = false;
+bool okVse2 = !EnableVse2; // if VSE2 disabled, treat as OK
+
+okVse1 = CaptureFftVse1(dayDir, eventId, out var c1, out var c2);
+if (okVse1)
+{
+    if (!string.IsNullOrEmpty(c1)) fftFiles.Add(c1);
+    if (!string.IsNullOrEmpty(c2)) fftFiles.Add(c2);
+}
+else
+{
+    Console.WriteLine("[FFT] STRICT: VSE1 capture FAILED after 5 attempts.");
+}
+
+if (EnableVse2)
+{
+    // VSE2 tends to need extra settle time between start/stop cycles
+    Thread.Sleep(1500);
+
+    okVse2 = CaptureFftVse2(dayDir, eventId, out var c3);
+    if (okVse2)
+    {
+        if (!string.IsNullOrEmpty(c3)) fftFiles.Add(c3);
+    }
+    else
+    {
+        Console.WriteLine("[FFT] STRICT: VSE2 capture FAILED after 5 attempts.");
+    }
+}
+
+bool fftAllOk = okVse1 && okVse2;
+if (!fftAllOk)
+{
+    Console.WriteLine("[FFT] STRICT: overall FFT result = FAILED (missing channel(s)).");
+}
+
 
             // 5) Allow VSE firmware to settle after FFT
-            Thread.Sleep(1500);
+            Thread.Sleep(2000);
 
-            // HARDEN: after FFT cycles, reconnect to avoid rare native assert in libVSEUtilities (firmwareVersion)
-            try
-            {
-                ReconnectVse1();
-                if (EnableVse2) ReconnectVse2();
-                Thread.Sleep(800);
-            }
-            catch (Exception rex)
-            {
-                Console.WriteLine("[WARN] Reconnect after FFT failed: " + rex.Message);
-                // proceed; QuickOverallRead will attempt EnsureVseConnected again
-            }
-
-(double Overall, object C1, object C2, object C3) post;
+            (double Overall, object C1, object C2, object C3) post;
             try
             {
                 post = QuickOverallRead();
@@ -335,7 +346,7 @@ public class FFTTriggerController
             }
 
 
-            File.WriteAllText(eventJsonPath, BuildEventJson(eventId, opZone, instantZone, status.StatusRowTs, pre, post, fftFiles));
+            File.WriteAllText(eventJsonPath, BuildEventJson(eventId, opZone, instantZone, status.StatusRowTs, pre, post, fftFiles, fftAllOk, okVse1, okVse2));
             Console.WriteLine("[EVENT] " + eventJsonPath);
         }
         catch (Exception ex)
@@ -359,7 +370,10 @@ public class FFTTriggerController
         string statusRowTs,
         (double Overall, object C1, object C2, object C3) pre,
         (double Overall, object C1, object C2, object C3) post,
-        List<string> fftFiles)
+        List<string> fftFiles,
+        bool fftAllOk,
+        bool vse1Ok,
+        bool vse2Ok)
     {
         var sb = new StringBuilder(2048);
         sb.AppendLine("{");
@@ -367,6 +381,9 @@ public class FFTTriggerController
         sb.AppendLine($"  \"version\": \"{VERSION}\",");
         sb.AppendLine($"  \"event_id\": \"{eventId}\",");
         sb.AppendLine($"  \"operator_zone\": \"{opZone}\",");
+        sb.AppendLine($"  \"fft_all_ok\": {(fftAllOk ? "true" : "false")},");
+        sb.AppendLine($"  \"vse1_fft_ok\": {(vse1Ok ? "true" : "false")},");
+        sb.AppendLine($"  \"vse2_fft_ok\": {(vse2Ok ? "true" : "false")},");
         sb.AppendLine($"  \"instant_zone\": \"{instantZone}\",");
         sb.AppendLine($"  \"status_row_ts\": \"{Escape(statusRowTs)}\",");
         sb.AppendLine($"  \"pre_overall_mmps\": {pre.Overall.ToString("G10", CultureInfo.InvariantCulture)},");
@@ -538,20 +555,24 @@ public class FFTTriggerController
     }
 
     private static bool CaptureFftVse2(string dayDir, string eventId, out string fileC3)
+{
+    fileC3 = null;
+
+    if (!EnableVse2) return false;
+
+    EnsureVseConnected();
+    if (_vse2 == null) return false;
+
+    // Ensure VSE2 is in the expected capture mode (HP2Hz, scale 490.5, decimate 2)
+    TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
+
+    string lastErr = "";
+
+    for (int attempt = 1; attempt <= 5; attempt++)
     {
-        fileC3 = null;
-
-        if (!EnableVse2) return false;
-
-        EnsureVseConnected();
-        if (_vse2 == null) return false;
-
-        // Ensure VSE2 is in the expected capture mode (HP2Hz, scale 490.5, decimate 2)
-        TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
-
+        // reset per attempt
         var c3x = new List<float>(FftSampleSize);
         var c3z = new List<float>(FftSampleSize);
-
         bool done = false;
 
         var col = new RawCollector(
@@ -562,40 +583,48 @@ public class FFTTriggerController
                 if (c3x.Count >= FftSampleSize) done = true;
             });
 
+        try { if (_rawVse2 != null) _rawVse2.stop(); } catch { }
         _rawVse2 = new IRawDataAnReSa();
-        bool started = false;
-        string lastErr = "";
-        for (int attempt = 1; attempt <= 3; attempt++)
+
+        // After writeToDevice() / reconnect cycles, VSE2 may need a short settle before starting raw stream
+        Thread.Sleep(1200);
+
+        // START attempt
+        try
         {
-            try { if (_rawVse2 != null) _rawVse2.stop(); } catch { }
-            _rawVse2 = new IRawDataAnReSa();
-
-            // After writeToDevice(), VSE2 may need a short settle before starting raw stream
-            Thread.Sleep(1200);
-
             var st = _rawVse2.start(_vse2, col, null, null);
-            if (st.isOk()) { started = true; break; }
+            if (!st.isOk())
+            {
+                lastErr = st.text();
+                Console.WriteLine(string.Format("FFT VSE2 start failed (attempt {0}/5): {1}", attempt, lastErr));
 
-            lastErr = st.text();
-            Console.WriteLine(string.Format("FFT VSE2 start failed (attempt {0}/3): {1}", attempt, lastErr));
+                // Reconnect VSE2 and re-apply params before retry
+                try { _vse2.disconnect(); } catch { }
+                _vse2 = null;
+                EnsureVseConnected();
+                if (_vse2 != null)
+                    TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
 
-            // Reconnect VSE2 and re-apply params before retry
+                Thread.Sleep(attempt <= 2 ? 1200 : 2500);
+                continue;
+            }
+        }
+        catch (Exception ex)
+        {
+            lastErr = ex.Message;
+            Console.WriteLine(string.Format("FFT VSE2 start exception (attempt {0}/5): {1}", attempt, lastErr));
+
             try { _vse2.disconnect(); } catch { }
             _vse2 = null;
             EnsureVseConnected();
-            if (_vse2 == null)
-            {
-                Thread.Sleep(500);
-                continue;
-            }
-            TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
+            if (_vse2 != null)
+                TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
+
+            Thread.Sleep(2000);
+            continue;
         }
 
-        if (!started)
-        {
-            Console.WriteLine("FFT VSE2 start failed: " + lastErr);
-            return false;
-        }
+        // COLLECT attempt
         var startUtc = DateTime.UtcNow;
         while (!done && (DateTime.UtcNow - startUtc).TotalSeconds < FftTimeoutSeconds)
             Thread.Sleep(5);
@@ -604,16 +633,32 @@ public class FFTTriggerController
 
         if (!done)
         {
-            Console.WriteLine("FFT VSE2 did not collect enough samples in time.");
-            return false;
+            lastErr = "timeout/not enough samples";
+            Console.WriteLine(string.Format("FFT VSE2 did not collect enough samples (attempt {0}/5). Retrying...", attempt));
+
+            // Reconnect VSE2 and re-apply params before retry
+            try { _vse2.disconnect(); } catch { }
+            _vse2 = null;
+            EnsureVseConnected();
+            if (_vse2 != null)
+                TryApplyParams(_vse2, BuildParamsForFftVse2(), "VSE2-FFT");
+
+            Thread.Sleep(2500);
+            continue;
         }
 
+        // SUCCESS
         fileC3 = Path.Combine(dayDir, $"FFT_{eventId}_C3_raw.csv");
         WriteRawCsv(fileC3, c3x, c3z);
 
         Console.WriteLine("[FFT] VSE2 saved: " + fileC3);
         return true;
     }
+
+    Console.WriteLine("FFT VSE2 failed after retries: " + lastErr);
+    return false;
+}
+
 
     private static void WriteRawCsv(string path, List<float> xs, List<float> zs)
     {
@@ -655,24 +700,7 @@ public class FFTTriggerController
     }
 
     
-    
-    private static void ReconnectVse1()
-    {
-        try { _rawVse1?.stop(); } catch { }
-        _rawVse1 = null;
-
-        try { _vse1?.disconnect(); } catch { }
-        _vse1 = null;
-
-        // small settle before reconnect
-        Thread.Sleep(500);
-
-        _vse1 = new IVse();
-        var conn = _vse1.connect(IpVse1, PortVse1);
-        if (!conn.isOk()) throw new Exception("VSE1 reconnect failed: " + conn.text());
-    }
-
-private static void ReconnectVse2()
+    private static void ReconnectVse2()
     {
         if (!EnableVse2) return;
 
